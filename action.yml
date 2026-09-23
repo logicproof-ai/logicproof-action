@@ -129,7 +129,16 @@ runs:
           exit 1
         fi
 
-        N=$(python3 -c "import json,sys; print(len(json.load(open('$INFORME')).get('hallazgos', [])))" 2>/dev/null || echo 0)
+        # Sin informe legible no hay veredicto, diga lo que diga el código. El
+        # lanzador de Nuitka devuelve 0 cuando el motor muere por una señal
+        # (medido el 22-09-2026 sobre Broadleaf: violación de segmento, salida 0,
+        # informe VACÍO): contar 0 hallazgos ahí sería dar por limpio un código
+        # que nadie ha terminado de mirar.
+        if ! N=$(python3 -c "import json,sys; print(len(json.load(open('$INFORME'))['hallazgos']))" 2>/dev/null); then
+          echo "::error::LogicProof terminó sin entregar el informe (código $CODIGO): el análisis no ha concluido."
+          cat "$RUNNER_TEMP/logicproof.err" >&2
+          exit 1
+        fi
         echo "hallazgos=$N" >> "$GITHUB_OUTPUT"
         echo "informe=$INFORME" >> "$GITHUB_OUTPUT"
         echo "codigo=$CODIGO"   >> "$GITHUB_OUTPUT"
