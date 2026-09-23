@@ -1,0 +1,210 @@
+# =====================================================================
+# LA ACTION QUE SE LLEVA EL CLIENTE.
+#
+# Todo lo que tiene que escribir en su repositorio es esto:
+#
+#     - uses: logicproof-ai/logicproof-action@v1
+#       with:
+#         api-key: ${{ secrets.LOGICPROOF_API_KEY }}
+#
+# Y ya está. La Action descarga el binario, lo ejecuta sobre su código y comenta
+# en el Pull Request los parches que el motor ha demostrado.
+#
+# POR QUÉ DESCARGA UN BINARIO Y NO INSTALA PYTHON
+# -----------------------------------------------
+# Porque es lo que se vende: el motor no viaja en código legible (ver
+# `deploy/compilar-cli.sh`). Y de paso el cliente se ahorra instalar Python, Z3 y
+# 300 MB de dependencias en cada ejecución de su CI.
+# =====================================================================
+name: "LogicProof AI"
+description: "Demuestra con matemáticas si tu lógica de negocio se puede romper, y propone el arreglo."
+author: "LogicProof AI"
+
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  api-key:
+    description: "Tu API Key. Ponla como secreto del repositorio, NUNCA en el fichero."
+    required: true
+  ruta:
+    description: "Qué analizar. Por omisión, el repositorio entero."
+    required: false
+    default: "."
+  bloquear-en:
+    description: >
+      A partir de qué gravedad falla el paso: `critica` (por omisión), `alta` o
+      `media`. Con `ninguna` nunca falla: solo informa.
+    required: false
+    default: "critica"
+  comentar-pr:
+    description: "Escribir un comentario en el Pull Request con los hallazgos."
+    required: false
+    default: "true"
+  sarif:
+    description: >
+      Ruta donde escribir también el informe SARIF, para subirlo a la pestaña
+      Security con `github/codeql-action/upload-sarif`. Vacío: no se escribe.
+    required: false
+    default: ""
+  version:
+    description: "Versión del analizador. `latest` coge la última publicada."
+    required: false
+    default: "latest"
+
+outputs:
+  hallazgos:
+    description: "Cuántas brechas se han demostrado."
+    value: ${{ steps.analizar.outputs.hallazgos }}
+  informe:
+    description: "Ruta del informe JSON, por si quieres hacer algo más con él."
+    value: ${{ steps.analizar.outputs.informe }}
+
+runs:
+  using: composite
+  steps:
+    # ── 1. El binario ────────────────────────────────────────────────────
+    # Se cachea por versión: descargar 22 MB en cada Pull Request es tiempo del
+    # cliente y ancho de banda nuestro, y el binario de una versión no cambia.
+    - name: Recuperar el analizador de la caché
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.logicproof/bin
+        key: logicproof-${{ inputs.version }}-linux-x64
+
+    - name: Descargar el analizador
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p ~/.logicproof/bin
+        VER="${{ inputs.version }}"
+        if [ "$VER" = "latest" ]; then
+          URL="https://github.com/logicproof-ai/logicproof-cli/releases/latest/download/logicproof-linux-x64"
+        else
+          URL="https://github.com/logicproof-ai/logicproof-cli/releases/download/${VER}/logicproof-linux-x64"
+        fi
+        curl -fsSL --retry 3 -o ~/.logicproof/bin/logicproof "$URL"
+        chmod +x ~/.logicproof/bin/logicproof
+
+    # ── 2. El análisis ───────────────────────────────────────────────────
+    - name: Analizar
+      id: analizar
+      shell: bash
+      env:
+        # LA ÚNICA VÍA DE PEAJE. El binario lee esta variable, pregunta al
+        # servidor y solo entonces carga el motor. Es exactamente la misma puerta
+        # que usan la CLI en un portátil y la extensión de VS Code — ver
+        # `app/cli/licencia.py`.
+        LOGICPROOF_API_KEY: ${{ inputs.api-key }}
+        # Por el entorno y no pegado en el guion: una ruta con comillas o `$(...)`
+        # escrita por el cliente no debe poder ejecutarse como orden.
+        SARIF: ${{ inputs.sarif }}
+      run: |
+        set -uo pipefail
+        if [ -z "${LOGICPROOF_API_KEY:-}" ]; then
+          echo "::error::Falta la API Key. Añádela como secreto del repositorio y pásala en 'api-key'."
+          exit 1
+        fi
+        INFORME="$RUNNER_TEMP/logicproof.json"
+        UMBRAL="${{ inputs.bloquear-en }}"
+        [ "$UMBRAL" = "ninguna" ] && UMBRAL="critica"
+
+        EXTRA=()
+        [ -n "${SARIF:-}" ] && EXTRA=(--sarif "$SARIF")
+
+        ~/.logicproof/bin/logicproof "${{ inputs.ruta }}" \
+          --bloquear-en "$UMBRAL" --json ${EXTRA[@]+"${EXTRA[@]}"} > "$INFORME" 2> "$RUNNER_TEMP/logicproof.err"
+        CODIGO=$?
+
+        # El binario distingue los códigos a propósito, y aquí hay que
+        # respetarlo: 1 = hay una brecha demostrada; 2 = no he podido ni empezar
+        # (licencia, red, fichero ilegible). Tratarlos igual le diría al cliente
+        # «tienes un fallo» cuando lo que pasa es que su suscripción caducó.
+        if [ "$CODIGO" = "2" ]; then
+          echo "::error::LogicProof no ha podido ejecutarse:"
+          cat "$RUNNER_TEMP/logicproof.err" >&2
+          exit 1
+        fi
+
+        N=$(python3 -c "import json,sys; print(len(json.load(open('$INFORME')).get('hallazgos', [])))" 2>/dev/null || echo 0)
+        echo "hallazgos=$N" >> "$GITHUB_OUTPUT"
+        echo "informe=$INFORME" >> "$GITHUB_OUTPUT"
+        echo "codigo=$CODIGO"   >> "$GITHUB_OUTPUT"
+
+    # ── 3. El resumen y el comentario ────────────────────────────────────
+    # El resumen sale SIEMPRE, también cuando no hay nada: «hemos mirado y está
+    # limpio» es información, y un paso que solo habla cuando hay malas noticias
+    # acaba ignorado.
+    - name: Escribir el resumen
+      if: always()
+      shell: bash
+      env:
+        INFORME: ${{ steps.analizar.outputs.informe }}
+      run: |
+        python3 - <<'PYEOF' >> "$GITHUB_STEP_SUMMARY"
+        import json, os
+        try:
+            datos = json.load(open(os.environ["INFORME"], encoding="utf-8"))
+        except Exception:
+            print("## LogicProof AI\n\nNo se ha podido leer el informe."); raise SystemExit
+        hallazgos = datos.get("hallazgos") or []
+        print("## LogicProof AI\n")
+        if not hallazgos:
+            print(f"✅ Sin brechas demostradas en {len(datos.get('analizados') or [])} fichero(s).")
+            raise SystemExit
+        print(f"❌ **{len(hallazgos)} brecha(s) demostradas.**\n")
+        for h in hallazgos:
+            print(f"### `{h.get('path')}:{h.get('lineno')}` — {h.get('description','')}")
+            print(f"*{h.get('severidad','').upper()}* · {h.get('por_que','')}\n")
+            cert = h.get("parche_certificado") or {}
+            if cert.get("diff"):
+                print("**Parche demostrado** — el motor lo ha aplicado y ha vuelto "
+                      "a atacar el código: la brecha ya no existe.\n")
+                print("```diff"); print(cert["diff"].rstrip()); print("```\n")
+        PYEOF
+
+    - name: Comentar en el Pull Request
+      if: ${{ inputs.comentar-pr == 'true' && github.event_name == 'pull_request' }}
+      uses: actions/github-script@v7
+      env:
+        INFORME: ${{ steps.analizar.outputs.informe }}
+      with:
+        script: |
+          const fs = require('fs');
+          let datos;
+          try { datos = JSON.parse(fs.readFileSync(process.env.INFORME, 'utf8')); }
+          catch (e) { core.info('sin informe que comentar'); return; }
+          const h = datos.hallazgos || [];
+          if (h.length === 0) return;   // no se comenta para decir que todo va bien
+          const partes = h.slice(0, 10).map(f => {
+            const cert = f.parche_certificado || {};
+            const diff = cert.diff ? "\n\n<details><summary>Parche demostrado</summary>\n\n```diff\n"
+                                     + cert.diff.trimEnd() + "\n```\n</details>" : "";
+            return `### \`${f.path}:${f.lineno}\` — ${f.description || ''}\n`
+                 + `**${(f.severidad || '').toUpperCase()}** · ${f.por_que || ''}${diff}`;
+          });
+          const cola = h.length > 10 ? `\n\n…y ${h.length - 10} más.` : '';
+          await github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `## 🔍 LogicProof AI\n\n**${h.length} brecha(s) demostradas** `
+                + `— no son sospechas: cada una viene con los valores exactos que la provocan.\n\n`
+                + partes.join('\n\n') + cola,
+          });
+
+    # ── 4. Fallar, si toca ───────────────────────────────────────────────
+    # Va al final y como paso aparte: así el cliente ve el comentario y el
+    # resumen ANTES de que el paso se ponga en rojo. Un fallo sin explicación
+    # delante es una llamada al soporte.
+    - name: Resultado
+      if: ${{ inputs.bloquear-en != 'ninguna' }}
+      shell: bash
+      run: |
+        if [ "${{ steps.analizar.outputs.codigo }}" = "1" ]; then
+          echo "::error::LogicProof ha demostrado ${{ steps.analizar.outputs.hallazgos }} brecha(s). Mira el resumen."
+          exit 1
+        fi
