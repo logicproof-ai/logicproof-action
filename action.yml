@@ -67,12 +67,24 @@ runs:
     # ── 1. El binario ────────────────────────────────────────────────────
     # Se cachea por versión: descargar 22 MB en cada Pull Request es tiempo del
     # cliente y ancho de banda nuestro, y el binario de una versión no cambia.
+    - name: Resolver versión
+      id: resolver
+      shell: bash
+      run: |
+        VER="${{ inputs.version }}"
+        if [ "$VER" = "latest" ]; then
+          # Averiguar el tag real detrás de 'latest' (p.ej. v1.0.1)
+          URL=$(curl -w "%{url_effective}" -I -L -s -S -o /dev/null https://github.com/logicproof-ai/logicproof-cli/releases/latest)
+          VER=$(basename "$URL")
+        fi
+        echo "version=$VER" >> "$GITHUB_OUTPUT"
+
     - name: Recuperar el analizador de la caché
       id: cache
       uses: actions/cache@v4
       with:
         path: ~/.logicproof/bin
-        key: logicproof-${{ inputs.version }}-linux-x64
+        key: logicproof-${{ steps.resolver.outputs.version }}-linux-x64
 
     - name: Descargar el analizador
       if: steps.cache.outputs.cache-hit != 'true'
@@ -80,12 +92,7 @@ runs:
       run: |
         set -euo pipefail
         mkdir -p ~/.logicproof/bin
-        VER="${{ inputs.version }}"
-        if [ "$VER" = "latest" ]; then
-          URL="https://github.com/logicproof-ai/logicproof-cli/releases/latest/download/logicproof-linux-x64"
-        else
-          URL="https://github.com/logicproof-ai/logicproof-cli/releases/download/${VER}/logicproof-linux-x64"
-        fi
+        URL="https://github.com/logicproof-ai/logicproof-cli/releases/download/${{ steps.resolver.outputs.version }}/logicproof-linux-x64"
         curl -fsSL --retry 3 -o ~/.logicproof/bin/logicproof "$URL"
         chmod +x ~/.logicproof/bin/logicproof
 
