@@ -71,11 +71,18 @@ runs:
       id: resolver
       shell: bash
       run: |
+        set -euo pipefail
         VER="${{ inputs.version }}"
         if [ "$VER" = "latest" ]; then
-          # Averiguar el tag real detrás de 'latest' (p.ej. v1.0.1)
+          # Averiguar el tag real detrás de 'latest' (p.ej. v1.0.1): con la
+          # clave «latest» la caché serviría el binario viejo para siempre.
           URL=$(curl -w "%{url_effective}" -I -L -s -S -o /dev/null https://github.com/logicproof-ai/logicproof-cli/releases/latest)
           VER=$(basename "$URL")
+          # Sin ninguna Release publicada GitHub redirige a /releases, no a /tag/vX.
+          case "$URL" in
+            */releases/tag/*) ;;
+            *) echo "::error::No hay ninguna versión publicada de logicproof-cli ($URL)"; exit 1 ;;
+          esac
         fi
         echo "version=$VER" >> "$GITHUB_OUTPUT"
 
